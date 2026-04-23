@@ -1,8 +1,8 @@
 # Onderzoeksrapport: Kieskeurig.be CSS Account Suspensie
 
-**Datum:** 2026-04-22  
+**Datum:** 2026-04-22 / bijgewerkt 2026-04-23  
 **Onderzocht door:** Paul Molenaar / Claude (Reshift)  
-**Status:** Oorzaak geïdentificeerd — fix nog niet geïmplementeerd  
+**Status:** Fix gedeeltelijk geïmplementeerd — bol.com-deduplicatie ontbreekt nog  
 **Account:** Kieskeurig.be CSS — Merchant Center ID `5352009739`, Google Ads ID `8823617537`
 
 ---
@@ -183,3 +183,68 @@ WHERE shopping_product.custom_attribute4 = 'longtail'
 | `compare-infra/applications/jobs/job-runner/extraction/google-css-expiry.yaml` | CronJob expiry (dagelijks 12:00) |
 | `compare-infra/applications/jobs/job-runner/configmap.yaml` | CSS account config + credentials |
 | `kk_feedcheck/fetch_css_feed.py` | Script voor handmatige feed-analyse via Google Ads API |
+
+---
+
+## 9. Verificatie geïmplementeerde fixes (2026-04-23)
+
+### Broncode onderzocht
+`pc_api/src/Reshift.ProductCatalog.Jobs/Application/Extraction/Css/Services/ProductDataProcessor.cs`
+
+### Wat WEL geïmplementeerd is
+
+**Single-merchant filter** (SQL pre-filter, regel 127):
+```sql
+HAVING COUNT(DISTINCT p.shop) >= 2
+   AND COUNT(DISTINCT CASE WHEN p.shop NOT IN (79, 765, 7811) THEN p.shop END) >= 1
+```
+Producten met slechts 1 shop worden gefilterd. ✅
+
+**Amazon-deduplicatie** (C#, regel 315–328):
+```csharp
+private static readonly HashSet<int> AmazonShopIds = [79, 765, 7810, 7811, 7996, 7997];
+var effectivePriceCount = nonAmazonPriceCount + (hasAmazonPrice ? 1 : 0);
+```
+Alle Amazon-varianten tellen als 1 effectieve merchant. ✅
+
+### Wat NIET geïmplementeerd is
+
+**Bol.com-deduplicatie** — er bestaat geen `BolShopIds`-lijst. Bol.com en bol.plaza zijn aparte shop-records in de database en worden door de code als 2 onafhankelijke merchants geteld, terwijl Google ze als 1 merchant beschouwt (beide eigendom van Ahold-Delhaize). ❌
+
+### Tijdlijn broncode
+
+| Datum | Commit | Wijziging |
+|-------|--------|-----------|
+| 11 sep 2025 | `cf463db8` | `ProductDataProcessor.cs` aangemaakt — geen merchant-deduplicatie |
+| 14 feb 2026 | `0b9dad47` | Amazon-deduplicatie toegevoegd (Tim Baijens) |
+| 23 feb 2026 | `f4232b9a` | Amazon-logica uitgebreid |
+| 6 mrt 2026 | `52b0d787` | Laatste wijziging (parallelisme) |
+
+Op 14 februari was het moment waarop bol.com dezelfde behandeling als Amazon had moeten krijgen.
+
+---
+
+## 10. Analyse meest recente feed (2026-04-23)
+
+**Bestand:** `~/Downloads/_2026-04-22_16-25-54.csv` — rechtstreeks uit het Google-account
+
+| Kenmerk | Waarde |
+|---------|--------|
+| Totaal producten | 133.574 |
+| Status | **100% Not approved** (account nog gesuspendeerd) |
+| Laatste update | 133.550 producten op 2026-04-22 (job draait door) |
+| Minimum offers | 2 (geen single-merchant producten — filter werkt) |
+| Product ID formaat | 99,5% UUID (virtuele producten), 0,5% numeriek |
+
+**Offers-verdeling:**
+
+| Offers | Aantal | % |
+|--------|--------|---|
+| 2 | 100.714 | **75,4%** |
+| 3 | 22.706 | 17,0% |
+| 4 | 5.978 | 4,5% |
+| 5+ | 4.176 | 3,1% |
+
+75% van de feed heeft precies 2 aanbieders. Dit is de risicogroep voor de bol.com-dubbeltelling. Zonder deduplicatie telt bol.com + bol.plaza als Offers=2, maar Google ziet dit als 1 merchant.
+
+**Geldt ook voor NL:** Dezelfde `ProductDataProcessor.cs` verwerkt NL en BE. NL is niet gesuspendeerd (34% ELIGIBLE, 28% ELIGIBLE_LIMITED), vermoedelijk omdat de NL-markt meer echte concurrentie per product heeft. Latent risico blijft aanwezig.

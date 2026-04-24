@@ -181,7 +181,147 @@ Het originele 2026-04-22 rapport over de BE-suspensie blijft ongewijzigd — dat
 
 ---
 
-## 7. Bijlagen
+## 7. Verificatie: hebben onze efficiency-slagen pc_api geraakt?
+
+Gedreven door de vraag of de feed-krimp toch door onze BigQuery-optimalisaties van 23 april kan zijn veroorzaakt. Per actie nagegaan:
+
+| Onze actie | Target | Leest pc_api dit? |
+|---|---|---|
+| `kieskeurignl_erpc_calculation` gepauzeerd | BQ scheduled query → `reshift_insights.kieskeurignl_erpc_calculation` | **Nee** — pc_api leest uit `reshift_insights.erpc_table_7d` (andere tabel) |
+| Bemmel-query 5min → 1×/dag | scheduled query `68d84eee` (jspijkstra) | **Nee** — Bemmel-rankingsysteem heeft geen raakpunt met CSS-extraction |
+| Amazon-queries gepauzeerd | `conversions_staging.amazon_earnings_kieskeurig_id_ean` | **Nee** — post-processing van click-attributie, niet feed-input |
+
+**Conclusie:** onze optimalisaties raakten de feed niet.
+
+### Wel: een verwante vondst
+
+Pc_api's `PriceErpcSyncJob.cs`:
+```csharp
+"SELECT ean, shop_id, erpc 
+ FROM `kieskeurig-data-analyse.reshift_insights.erpc_table_7d` 
+ WHERE erpc IS NOT NULL AND erpc > 0"
+```
+
+Deze tabel heeft **0 rijen** en is laatst gewijzigd op **2025-09-30** — al 7 maanden dood. Tim heeft op 4 maart `applyErpcOverride` toegevoegd aan `GetOrderedPricesAsync` (`571de796`), maar er is geen data om te overriden. Niet feed-brekend (fallback werkt), wel onderhoud-debt.
+
+Er zijn **vier actieve ERPC-achtige scheduled queries** in BigQuery die naar andere tabellen schrijven:
+- `erpc_product_daily` (elke 4u)
+- `erpc_product_daily_history` (dagelijks 09:30)
+- `erpc_ean_buckets_daily` (dagelijks 09:15)
+- `kieskeurignl_erpc_calculation` (disabled door ons 23 apr — harmloos)
+
+Niemand vult `erpc_table_7d`. Actie: of pc_api migreren naar `erpc_product_daily`, of de sync-code verwijderen. Zie AANDACHTSLIJST item 11.
+
+---
+
+## 8. Onmiddellijk herstel — concreet uitvoerbare stappen
+
+**Doel:** de feed terug naar zijn werkelijke kwaliteits-maximum brengen, zonder Tim's bol-dedup-fix te ondermijnen.
+
+### Strategie
+
+Tim's filter is correct. De 260k-drop komt doordat `GoogleCssExpiryJob` producten verwijderde sneller dan pc_api ze kon rehydrateren met de nieuwe filter-logica. Herstel = voorkomen dat er meer verdwijnen + pc_api laten rehydrateren.
+
+### Stap 1 — Stop de bloeding (5 min)
+
+Schort de expiry-job op zodat hij niet verder verwijdert terwijl we pc_api laten werken.
+
+```bash
+kubectl patch cronjob job-google-css-expiry -n production \
+  -p '{"spec":{"suspend":true}}'
+
+kubectl get cronjob job-google-css-expiry -n production -o jsonpath='{.spec.suspend}'
+# Verwacht: true
+```
+
+Risico: nul. De job doet alleen DELETE. Tijdens de pause blijven er ook niet-gekwalificeerde producten staan, maar die worden toch al door Google's 30-dagen-interne-expiry opgeruimd zolang pc_api ze niet refresht.
+
+### Stap 2 — Forceer volledige push (30-60 min uitvoeringstijd)
+
+Trigger `job-google-css-extraction` direct, los van het uurlijkse cron-schema.
+
+```bash
+kubectl create job --from=cronjob/job-google-css-extraction \
+  manual-push-$(date +%Y%m%d-%H%M) -n production
+
+# Volg uitvoering:
+kubectl logs -f job/manual-push-<TIMESTAMP> -n production
+```
+
+Belangrijke log-regels om op te letten:
+- `Account: Kieskeurig.nl, Publication ID: 1, Total Products: N` (aantal in te voeren kandidaten)
+- `Performance: X products/sec | Skip Summary - NotFound: ..., NotEnoughPrices: ...`
+- `Batch processing completed: ... products yielded`
+
+Het `Yielded`-aantal is hoeveel er daadwerkelijk naar Merchant Center gepusht zijn.
+
+### Stap 3 — Verifieer (5 min)
+
+Zodra de job klaar is:
+
+```bash
+cd ~/kk_feedcheck && python3 fetch_css_feed.py
+```
+
+Vergelijk de nieuwe `NL_*.json` met `NL_20260424T140032Z.json`:
+- **Product-count > 79.808**: pc_api heeft producten teruggepusht die door de expiry-job waren weggehaald — succes
+- **Product-count ≈ 79.808 of minder**: Tim's filter filtert een groot deel van de 260k correct uit — geen bug, wel bewust kleinere feed
+
+Beide uitkomsten zijn legitiem. De **ware feed-grootte** is wat je na stap 3 ziet.
+
+### Stap 4 — Heractiveer expiry-job (1 min)
+
+```bash
+kubectl patch cronjob job-google-css-expiry -n production \
+  -p '{"spec":{"suspend":false}}'
+```
+
+### Stap 5 (permanent) — Verhoog expiry-drempel naar 48u
+
+Pull-request op `reshift/pc_api`, bestand `src/Reshift.ProductCatalog.Jobs/Application/Extraction/Css/GoogleCssExpiryJob.cs`:
+
+```diff
+- .Where(cssProduct => cssProduct.CssProductStatus.LastUpdateDate < DateTime.UtcNow.AddHours(-12))
++ .Where(cssProduct => cssProduct.CssProductStatus.LastUpdateDate < DateTime.UtcNow.AddHours(-48))
+```
+
+Eén regel, zeer laag risico. Bij een toekomstige pijplijn-hikup heeft het systeem 48u speling in plaats van 12u. Minimale CSS-compliance-impact (Google houdt producten sowieso 30 dagen).
+
+### Tijdschema
+
+| Stap | Duur | Wachttijd daarna |
+|---|---|---|
+| 1. Suspend expiry | 1 min | — |
+| 2. Trigger extraction | 30-60 min | wachten op completion |
+| 3. Verifieer snapshot | 5 min | — |
+| 4. Resume expiry | 1 min | — |
+| 5. PR expiry-drempel | 15 min PR, + review-cycle | deploy afwachten |
+
+Totaal onmiddellijk herstel: **~1-1,5 uur** vanaf moment dat je kubectl-toegang hebt.
+
+### Toegangsvereisten
+
+- `kubectl` context voor Scaleway cluster, namespace `production` — beschikbaar via de `compare-infra` setup (pas nog bevestigen dat jouw user admin-rechten heeft op die namespace)
+- Optioneel: PR-review-rechten op `reshift/pc_api` voor stap 5
+
+### Risico-beoordeling
+
+| Stap | Risico | Mitigatie |
+|---|---|---|
+| Suspend expiry-job | Laag — oude non-compliante producten blijven tijdelijk staan | Houd stap kort (<2u) en Resume direct na verificatie |
+| Manual extraction trigger | Laag — doet hetzelfde als uurlijks, alleen eerder | Monitor logs; bij failure: gewone cron pakt het later op |
+| Verifieer snapshot | Nul risico | — |
+| Resume expiry | Nul risico | — |
+| 12u → 48u code-change | Laag — uitstel van cleanup van stale products | Review door Tim; eventueel eerst op tst-account |
+
+### Wat NIET doet deze hersteloperatie
+
+- Producten die Tim's filter terecht afwijst (single-merchant disguised as multi) komen NIET terug. Dat is de bedoeling.
+- De 4 gepauzeerde Ads-campagnes blijven PAUSED. Dit is een Ads-management-kwestie, geen feed-kwestie.
+
+---
+
+## 9. Bijlagen
 
 - Ads API snapshots: `~/kk_feedcheck/snapshots/NL_20260422T135545Z.json`, `NL_20260424T140032Z.json`
 - Code-referenties:
